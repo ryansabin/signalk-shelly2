@@ -395,4 +395,123 @@ describe('Device Class Unit Tests', () => {
       expect(typeof device.reconnectionAttempts).to.equal('number')
     })
   })
+
+  describe('Poll failure handling', () => {
+    let device: any
+
+    beforeEach(() => {
+      const { Device } = require('../dist/device')
+      device = new Device(
+        mockApp,
+        mockPlugin,
+        null,
+        '192.168.1.100',
+        'host.name',
+        'shellyplugusg4-test'
+      )
+      device.setDeviceSettings(deviceSettings)
+      device.connected = true
+      device.getCapabilities(sampleDeviceStatus)
+    })
+
+    it('should not tear down the connection after a single poll timeout', async () => {
+      sinon
+        .stub(device, 'send')
+        .rejects(new Error('Request 1 for Shelly.GetStatus timed out'))
+      const reconnect = sinon.stub(device, 'reconnect')
+      const disconnect = sinon.stub(device, 'disconnect')
+
+      let err: any
+      try {
+        await device.poll()
+      } catch (e) {
+        err = e
+      }
+
+      expect(err).to.be.instanceOf(Error)
+      expect(device.connected).to.be.true
+      expect(reconnect.called).to.be.false
+      expect(disconnect.called).to.be.false
+    })
+
+    it('should reconnect after three consecutive poll failures', async () => {
+      sinon.stub(device, 'send').rejects(new Error('timed out'))
+      const reconnect = sinon.stub(device, 'reconnect')
+
+      for (let i = 0; i < 3; i++) {
+        await device.poll().catch(() => {})
+      }
+
+      expect(reconnect.calledOnce).to.be.true
+    })
+
+    it('should reset the failure count after a successful poll', async () => {
+      const send = sinon.stub(device, 'send')
+      send.onCall(0).rejects(new Error('timed out'))
+      send.onCall(1).rejects(new Error('timed out'))
+      send.onCall(2).resolves(sampleDeviceStatus)
+      send.onCall(3).rejects(new Error('timed out'))
+      send.onCall(4).rejects(new Error('timed out'))
+      const reconnect = sinon.stub(device, 'reconnect')
+
+      for (let i = 0; i < 5; i++) {
+        await device.poll().catch(() => {})
+      }
+
+      expect(reconnect.called).to.be.false
+    })
+
+    it('should not send a new poll while the previous one is pending', async () => {
+      let resolveFirst: any
+      const send = sinon
+        .stub(device, 'send')
+        .callsFake(() => new Promise((resolve) => (resolveFirst = resolve)))
+
+      const first = device.poll()
+      await device.poll()
+      expect(send.calledOnce).to.be.true
+
+      resolveFirst(sampleDeviceStatus)
+      await first
+      device.poll().catch(() => {})
+      expect(send.calledTwice).to.be.true
+    })
+
+    it('should schedule a reconnection when polled while disconnected', async () => {
+      device.connected = false
+      const attempt = sinon.stub(device, 'attemptReconnection')
+
+      await device.poll()
+
+      expect(attempt.calledOnce).to.be.true
+    })
+
+    it('should clear the reconnecting flag after a successful reconnection', async () => {
+      const clock = sinon.useFakeTimers()
+      try {
+        const fakeWs: any = {
+          on: sinon.stub(),
+          removeAllListeners: sinon.stub(),
+          terminate: sinon.stub(),
+          readyState: 1
+        }
+        sinon.stub(device, 'createWebSocketConnection').resolves(fakeWs)
+        sinon.stub(device, 'setupConnection').callsFake(async () => {
+          device.connected = true
+        })
+
+        device.connected = false
+        device.attemptReconnection()
+        expect(device.reconnecting).to.be.true
+
+        await clock.tickAsync(1000)
+
+        expect(device.connected).to.be.true
+        expect(device.reconnecting).to.be.false
+        expect(device.reconnectionAttempts).to.equal(0)
+      } finally {
+        clock.restore()
+      }
+    })
+  })
 })

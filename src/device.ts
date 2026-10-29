@@ -68,6 +68,8 @@ export class Device {
   private reconnectTimeout: NodeJS.Timeout | null = null
   private shouldReconnect: boolean = true
   private isReconnecting: boolean = false
+  private polling: boolean = false
+  private pollFailures: number = 0
   sentStaticDeltas: boolean = false
   private authMessage: any = undefined
   private channel: Channel | null = null
@@ -142,8 +144,20 @@ export class Device {
     this.sentMeta = false
 
     this.debug(`Connecting to device at ${this.address}`)
-    this.ws = await this.createWebSocketConnection()
-    return this.setupConnection()
+    // Mark the connect as in progress so poll() doesn't start a parallel one.
+    this.isReconnecting = true
+    try {
+      this.ws = await this.createWebSocketConnection()
+      const result = await this.setupConnection()
+      this.isReconnecting = false
+      return result
+    } catch (error) {
+      this.isReconnecting = false
+      // Retry unless setupConnection gave up for good (auth failures call
+      // disconnect(), which clears shouldReconnect; attemptReconnection checks it).
+      this.attemptReconnection()
+      throw error
+    }
   }
 
   private async setupConnection() {
@@ -200,6 +214,7 @@ export class Device {
         }
       }
       this.app.error(`Failed to connect to device ${this.address}: ${error}`)
+      this.dropSocket()
       throw error
     }
   }
@@ -332,8 +347,11 @@ export class Device {
     this.reconnectTimeout = setTimeout(async () => {
       try {
         this.debug(`Reconnecting to device ${this.id || this.address}...`)
+        this.dropSocket()
         this.ws = await this.createWebSocketConnection()
         await this.setupConnection()
+        this.isReconnecting = false
+        this.reconnectAttempts = 0
         this.debug(
           `Successfully reconnected to device ${this.id || this.address}`
         )
@@ -486,17 +504,68 @@ export class Device {
 
   async poll() {
     if (!this.connected) {
+      // A failed (re)connect can leave the device here with nothing scheduled;
+      // make sure a retry is pending rather than going silent forever.
+      if (this.shouldReconnect && !this.isReconnecting) {
+        this.attemptReconnection()
+      }
       return
     }
 
+    // Don't stack requests on a device that is slow to answer.
+    if (this.polling) {
+      return
+    }
+    this.polling = true
+
     try {
       const status = await this.send('Shelly.GetStatus')
+      this.pollFailures = 0
       this.sendDeltas(status)
     } catch (error) {
-      this.disconnect()
-      this.connect()
+      // One slow reply over Wi-Fi is not a dead connection (and the device keeps
+      // pushing NotifyStatus meanwhile). Only reconnect after repeated failures.
+      this.pollFailures++
+      if (this.pollFailures >= 3) {
+        this.pollFailures = 0
+        this.reconnect()
+      }
       throw error
+    } finally {
+      this.polling = false
     }
+  }
+
+  // Tear down the current socket and schedule a fresh connection.
+  private reconnect() {
+    this.debug(`Reconnecting to unresponsive device ${this.id || this.address}`)
+    this.connected = false
+    this.authMessage = undefined
+    this.dropSocket()
+    this.shouldReconnect = true
+    this.isReconnecting = false
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout)
+      this.reconnectTimeout = null
+    }
+    this.reconnectAttempts = 0
+    this.attemptReconnection()
+  }
+
+  // Close a socket without triggering its close/error handlers.
+  private dropSocket() {
+    if (this.ws) {
+      const ws = this.ws
+      this.ws = null
+      ws.removeAllListeners()
+      ws.on('error', () => {})
+      ws.terminate()
+    }
+    Object.values(this.pendingRequests).forEach((request) => {
+      clearTimeout(request.timeout)
+      request.reject(new Error('Connection reset'))
+    })
+    this.pendingRequests = {}
   }
 
   getCapabilities(status: any) {
